@@ -1479,3 +1479,110 @@ export function toAdminAuditRecord(
     explorerUrl,
   };
 }
+
+// ── CLI support (issue: offline XDR decode) ─────────────────────────────────
+
+/**
+ * Minimal raw event shape accepted by the offline decode CLI.
+ *
+ * Mirrors the subset of `rpc.Api.EventResponse` the decoder actually reads, so
+ * a contributor can paste a base64 topic/value pair from an explorer or RPC log
+ * without fabricating the rest of the RPC envelope.
+ */
+export interface RawEventInput {
+  /** Base64-encoded `ScVal` topics, in order. `topic[0]` is the event name. */
+  topic: string[];
+  /** Base64-encoded `ScVal` value. */
+  value?: string;
+  /** Optional contract id, carried through to the decoded metadata. */
+  contractId?: string;
+  /** Optional ledger sequence. */
+  ledger?: number | string;
+  /** Optional transaction hash. */
+  txHash?: string;
+  /** Optional ledger close time (ISO string). */
+  ledgerClosedAt?: string;
+  /** Optional RPC event id / paging token. */
+  id?: string;
+}
+
+/** Raised when a raw event cannot be turned into an `rpc.Api.EventResponse`. */
+export class RawEventError extends Error {}
+
+function decodeBase64ScVal(b64: unknown, what: string): xdr.ScVal {
+  if (typeof b64 !== "string" || b64.trim() === "") {
+    throw new RawEventError(`${what}: expected a non-empty base64 string`);
+  }
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(b64.trim(), "base64");
+  } catch {
+    throw new RawEventError(`${what}: invalid base64`);
+  }
+  // `Buffer.from` is lenient; reject anything that does not round-trip.
+  if (bytes.length === 0 || bytes.toString("base64").replace(/=+$/, "") !== b64.trim().replace(/=+$/, "")) {
+    throw new RawEventError(`${what}: invalid base64`);
+  }
+  try {
+    return xdr.ScVal.fromXDR(bytes);
+  } catch (err) {
+    throw new RawEventError(
+      diagnostic(`${what}: malformed XDR: ${err instanceof Error ? err.message : String(err)}`),
+    );
+  }
+}
+
+/**
+ * Build a minimal `rpc.Api.EventResponse` from a raw base64 topic/value pair.
+ *
+ * Throws {@link RawEventError} (bounded message) when base64 or XDR is
+ * malformed, so the CLI can exit with code 2 without leaking unbounded input.
+ */
+export function buildRawEvent(input: RawEventInput): rpc.Api.EventResponse {
+  if (!input || typeof input !== "object") {
+    throw new RawEventError("event: expected an object");
+  }
+  if (!Array.isArray(input.topic) || input.topic.length === 0) {
+    throw new RawEventError("event.topic: expected a non-empty array of base64 strings");
+  }
+  const topic = input.topic.map((t, i) => decodeBase64ScVal(t, `event.topic[${i}]`));
+  const value =
+    input.value === undefined || input.value === null
+      ? undefined
+      : decodeBase64ScVal(input.value, "event.value");
+
+  return {
+    type: "contract",
+    topic,
+    value,
+    contractId: input.contractId,
+    ledger: input.ledger,
+    txHash: input.txHash,
+    ledgerClosedAt: input.ledgerClosedAt,
+    id: input.id,
+  } as unknown as rpc.Api.EventResponse;
+}
+
+/**
+ * JSON replacer for `JSON.stringify` that keeps `bigint` values pipeable to
+ * `jq` (which has no bigint type) while leaving every other field intact.
+ */
+export function scanJsonReplacer(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? value.toString() : value;
+}
+
+/**
+ * Decode a raw base64 event and return a JSON-ready object.
+ *
+ * Combines {@link buildRawEvent} and {@link decodeEvent}, and — when the
+ * decoder falls back to `unknown` — attaches the bounded reason so a CLI user
+ * can see why. Throws {@link RawEventError} on malformed input.
+ */
+export function decodeRawEvent(
+  source: ContractSource,
+  input: RawEventInput,
+  version: string = DEFAULT_CONTRACT_VERSION,
+): DecodedEvent {
+  const event = buildRawEvent(input);
+  return decodeEvent(source, event, version);
+}
